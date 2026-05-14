@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-tenstorrent"
+version = "0.0.0"
+description = "Tenstorrent hardware platform plugin for SGLang."
+requires-python = ">=3.10"
+dependencies = ["sglang"]
+
+[project.entry-points."sglang.srt.platforms"]
+tenstorrent = "sglang_tenstorrent:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+tenstorrent = "sglang_tenstorrent:register"
+
+[tool.setuptools.package-data]
+sglang_tenstorrent = ["mock_model/config.json", "README.md"]
+
+[tool.setuptools.packages.find]
+include = ["sglang_tenstorrent*"]
