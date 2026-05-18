@@ -39,9 +39,10 @@ manager, detokenizer subprocess, ZMQ IPC, sampler, KV pool bookkeeping, HTTP
 streaming.
 
 We drive the server with **`vllm bench serve`** against the OpenAI-compatible
-`/v1/chat/completions` endpoint, passing `--temperature 0` to force greedy
-sampling (see the *Sampling* note below for why that is the right comparison
-for DeepSeek). We read **TPOT** (time per output token, excluding the first
+`/v1/chat/completions` endpoint. The plugin's `TenstorrentSampler` makes the
+result invariant to the client's `temperature` / `top_p` / `top_k` (see
+*Sampling* below), so the default invocation passes `--temperature 0` purely
+for clarity. We read **TPOT** (time per output token, excluding the first
 token) and compute:
 
 ```
@@ -54,27 +55,31 @@ overhead_per_token  =  median TPOT  −  1 / mock_tsu
   the y-intercept is the bookkeeping floor.
 - **Dummy weights + cached logits buffer** mean the model contributes zero CPU
   cycles besides the sleep. Anything above the floor is SGLang.
-- **`process_batch_result_decode` runs against real CPU tensors**, so sampler
-  work, KV updates, and IPC traffic are all measured for real — nothing is
-  short-circuited.
+- **`process_batch_result_decode` runs against real CPU tensors**, so the
+  argmax sampler, KV updates, and IPC traffic are all measured for real.
+  Heavyweight CPU sampling (softmax / top-p / top-k / multinomial) is
+  short-circuited on purpose by `TenstorrentSampler` — see *Sampling* below.
 - **CPU engine has no overlap** (`forward_stream` / `schedule_stream` are
   no-ops on CPU per `scheduler.py:1502-1503`), so the scheduler tick is
   exposed serially. The measurement is exactly what a CPU user pays.
 
-## Measured floor: ~0.46 ms / token
+## Measured floor: ~0.45 ms / token
 
 `vllm bench serve` at concurrency = 1, ISL = 128, OSL = 2048, 4 prompts,
 TSU = 500 (forward floor = 2.0 ms / token):
 
-| Sampling                         | Median TPOT | Overhead vs floor |
-| -------------------------------- | ----------: | ----------------: |
-| `--temperature 0` (greedy)       |     2.46 ms |          +0.46 ms |
-| default (server-side sampling)   |     4.79 ms |          +2.79 ms |
+| Client config              | Median TPOT | Overhead vs floor |
+| -------------------------- | ----------: | ----------------: |
+| `--temperature 0` (greedy) |     2.45 ms |          +0.45 ms |
+| default (no temperature)   |     2.46 ms |          +0.46 ms |
 
-The greedy intercept (**~0.46 ms**) is SGLang's per-tick scheduler
-bookkeeping floor. The default-sampling row pays an extra ~2.3 ms / token of
-CPU-side sampler work; see the *Sampling* note below for why that doesn't
-apply to real DeepSeek serving.
+Both rows collapse to **~0.45 ms** because the plugin installs
+`TenstorrentSampler` (`sglang_tenstorrent/sampler.py`), which always returns
+`argmax(logits)` and ignores the client's `temperature` / `top_p` / `top_k`.
+That mirrors real Tenstorrent serving — the device samples on-chip, so
+SGLang's CPU sampler is bypassed regardless of what the client requests.
+Without that shim, the default row would pay ~2.3 ms / token of CPU sampler
+work (see *Sampling* below).
 
 ## Caveats
 
@@ -93,47 +98,46 @@ apply to real DeepSeek serving.
    the reported number to concurrent-user TPOT; the mock can't model
    batch-dependent forward time.
 
-## Sampling: greedy vs default
+## Sampling: handled on-device
 
-`vllm bench serve` no longer sets `temperature=0` by default; it falls
-through to whatever the server picks (top-p / top-k / multinomial over the
-full 131 072-entry DeepSeek-R1 vocab). The ~2.3 ms gap between the two rows
-above is **SGLang's CPU sampler cost on this host**, not anything in the
-scheduler, the network, or the client.
+DeepSeek-R1 on a Tenstorrent device samples on-chip and writes a one-hot
+logits row back to the host; SGLang's CPU sampler would be redundant. The
+plugin models this with `TenstorrentSampler`, registered automatically
+whenever the mock model is loaded (`sglang_tenstorrent/__init__.py` forces
+`server_args.sampling_backend = "tenstorrent"`). The sampler short-circuits
+to argmax and never touches softmax / top-p / top-k / multinomial.
 
-**Note for DeepSeek:** since sampling for DeepSeek is done on the device,
-it is only valid to compare the greedy sampling from the client perspective.
-The ~2.3 ms gap for "default" sampling is a mock artifact — the mock returns
-logits to SGLang, forcing the CPU sampler path that a real Tenstorrent
-device would bypass regardless of the client's `temperature` setting.
+Confirm it is active in the server log:
+
+```
+sampling_backend='tenstorrent'
+```
+
+If you ever benched this stack **without** the shim (e.g. against an older
+plugin build, or with `--sampling-backend pytorch`), the default-sampling
+client row would balloon by ~2.3 ms / token from CPU sampler work over the
+131 072-entry vocab. That extra cost is a mock artifact: a real Tenstorrent
+device would still bypass it.
 
 ## Running it
 
-Start the server with the mock model:
+The repo ships a `bench.sh` wrapper that manages the server lifecycle and
+runs `vllm bench serve` against the bundled mock:
 
 ```bash
-SGLANG_TENSTORRENT_MOCK_TSU=500 ./serve.sh
-```
+# canonical: TSU=500, greedy, concurrency=1
+./bench.sh
 
-In another shell, run the canonical greedy bench:
+# tighter forward floor
+TSU=1000 ./bench.sh
 
-```bash
-vllm bench serve \
-    --model 'deepseek-ai/DeepSeek-R1-0528' \
-    --backend openai-chat \
-    --endpoint /v1/chat/completions \
-    --dataset-name random \
-    --random-input-len 128 \
-    --random-output-len 2048 \
-    --num-prompts 4 \
-    --max-concurrency 1 \
-    --temperature 0 \
-    --port 30050
+# default-sampling reference (no --temperature 0)
+SAMPLING=default ./bench.sh
+
+# pass-through args go to vllm bench serve
+./bench.sh --random-output-len 1024 --num-prompts 8
 ```
 
 Read **Median TPOT** from the output. Scheduler overhead =
-`Median TPOT − 1000 / mock_tsu` (ms).
-
-For the default-sampling reference, drop `--temperature 0` — but remember
-that the extra ~2.3 ms it shows is a mock artifact (see *Sampling* above).
-Always run at concurrency = 1 — see *Scope* above.
+`Median TPOT − 1000 / TSU` (ms). At TSU=500 expect ~2.45 ms TPOT → ~0.45 ms
+overhead. Always at concurrency = 1 by design — see *Scope* above.
