@@ -1,76 +1,44 @@
 # SGLang Tenstorrent Plugin
 
-Out-of-tree SGLang plugin that registers Tenstorrent as an SRT platform and ships a
-Tenstorrent adapter for `deepseek-ai/DeepSeek-R1-0528`. A self-contained mock
-model is bundled so the plugin can be exercised on any host without Tenstorrent
-hardware -- useful for measuring SGLang's per-token overhead.
+Out-of-tree SGLang plugin that registers Tenstorrent as an SRT platform and
+ships a mock model for measuring SGLang's per-token streaming overhead.
 
 ## Requirements
 
 - `sglang >= 0.5.11` -- the release that introduced the `sglang.srt.platforms`
   and `sglang.srt.plugins` entry-point groups this plugin hooks into. Earlier
   releases (including `0.5.9`) do not import this plugin.
-- For real Tenstorrent inference: a working `ttnn` install. With `ttnn` absent
-  the plugin only activates when `SGLANG_TENSTORRENT_MOCK=1` is set.
+- `SGLANG_TENSTORRENT_MOCK=1` -- gates activation; the plugin is a no-op when
+  unset. `serve.sh` sets it for you.
 
 ## Install
 
 Tenstorrent hosts typically have no NVIDIA driver and so cannot import the
 standard SGLang wheel (its `sgl_kernel` dlopens `libcuda.so.1` at module load).
 SGLang does not publish a CPU wheel on PyPI, so both SGLang and its kernel
-package must be built from source. The recipe below is what we use; commands
-use [`uv`](https://docs.astral.sh/uv/) (`pip` works identically if you prefer).
+package must be built from source.
+
+`install.sh` at the repo root automates the whole recipe. From a checkout:
 
 ```bash
-# 1. checkout SGLang (any tag >= v0.5.11 -- platforms/plugins APIs need to exist)
-git clone --depth 1 --branch v0.5.11 https://github.com/sgl-project/sglang.git
-
-# 2. create a Python 3.12 venv -- the CPU kernel .so is built per-ABI, the
-#    venv's Python must match what you build against
-uv venv --python 3.12
+./install.sh
 source .venv/bin/activate
+```
 
-# 3. install CPU torch + build deps
-uv pip install \
-    --index https://download.pytorch.org/whl/cpu \
-    --index https://pypi.org/simple \
-    --index-strategy unsafe-best-match \
-    'torch==2.9.0' scikit-build-core 'setuptools>=64' wheel ninja cmake
+It creates `.venv/` (Python 3.12), clones SGLang at `v0.5.11` into `./sglang/`,
+builds `sglang-cpu` and `sglang-kernel-cpu` (~40 s of C++ compile), and
+installs this plugin editable. Re-runnable; reuses an existing venv and
+sglang checkout if found. Requires `uv`, `git`, and a C++ toolchain. Override
+defaults via env vars:
 
-# 4. build sglang-cpu: swap in the CPU pyproject, install, restore
-pushd sglang/python
-cp pyproject.toml pyproject.toml.bak && cp pyproject_cpu.toml pyproject.toml
-uv pip install --no-build-isolation \
-    --index https://download.pytorch.org/whl/cpu \
-    --index https://pypi.org/simple \
-    --index-strategy unsafe-best-match \
-    .
-mv pyproject.toml.bak pyproject.toml
-popd
-
-# 5. build sglang-kernel-cpu (compiles C++, ~40 s on a normal host)
-pushd sglang/sgl-kernel
-cp pyproject.toml pyproject.toml.bak && cp pyproject_cpu.toml pyproject.toml
-uv pip install --no-build-isolation .
-mv pyproject.toml.bak pyproject.toml
-popd
-
-# 6. install this plugin from a checkout
-git clone <this-repo> tt-sglang-plugin
-uv pip install -e ./tt-sglang-plugin
+```bash
+VENV_DIR=.venv-custom SGLANG_REPO=./vendor/sglang SGLANG_TAG=v0.5.11 ./install.sh
 ```
 
 There's no global registration step. The plugin advertises two entry points
 (`sglang.srt.platforms` and `sglang.srt.plugins`) which SGLang discovers
-automatically when it starts.
-
-Smoke-check the install:
-
-```bash
-SGLANG_TENSTORRENT_MOCK=1 python -c \
-  "import sglang_tenstorrent; print(sglang_tenstorrent.activate())"
-# expect: sglang_tenstorrent.platform.TenstorrentPlatform
-```
+automatically when it starts. The script runs a final smoke check
+(`activate()` should print the platform class).
 
 ## How activation works
 
@@ -84,11 +52,11 @@ tenstorrent = "sglang_tenstorrent:activate"
 tenstorrent = "sglang_tenstorrent:register"
 ```
 
-At server startup SGLang discovers them automatically. `activate()` returns the
-Tenstorrent platform class when either `ttnn` is importable or
-`SGLANG_TENSTORRENT_MOCK=1` is set; otherwise it returns `None` and SGLang
-ignores the plugin. `register()` adds the Tenstorrent model package to
-`ModelRegistry` and wires the `served_model_name` startup hook.
+At server startup SGLang discovers them automatically. `activate()` returns
+the Tenstorrent platform class when `SGLANG_TENSTORRENT_MOCK=1` is set;
+otherwise it returns `None` and SGLang ignores the plugin. `register()` adds
+the Tenstorrent model package to `ModelRegistry` and wires the
+`served_model_name` startup hook.
 
 There is no global configuration step -- if the package is installed in the
 active environment, `sglang serve` picks it up.
@@ -167,30 +135,18 @@ ITL against the mock's known per-token sleep floor. `--tsu` overrides
 `SGLANG_TENSTORRENT_MOCK_TSU`). See the Python script's module docstring for
 the full methodology and known limitations.
 
-## Real Tenstorrent inference
-
-When `ttnn` is importable on the host, `activate()` returns the real platform
-class and the plugin loads without any environment variable. The current model
-adapter at `models/deepseek_r1_0528.py` is the mock; replace its `forward()`
-with the real Tenstorrent execution path.
-
 ## Integration points
 
 | File | Role |
 | --- | --- |
 | `__init__.py` | Thin entry point: `activate()`, `register()`, startup hooks. |
 | `platform.py` | Hardware adapter: memory reporting, attention backend default, KV pool / paged allocator classes. |
-| `models/deepseek_r1_0528.py` | Model adapter -- replace with real Tenstorrent execution. |
+| `models/deepseek_r1_0528.py` | Mock model adapter (sleep-based, returns synthetic token ids). |
 | `deepseek_r1_0528.py` | Helpers and paths for the bundled mock. |
 | `mock_model/config.json` | Mock model config (vocab size, per-forward delay, etc.). |
 
 ## Notes
 
-- **Device-side sampling.** SGLang currently expects `forward()` to return
-  logits and samples on the host. The mock uses a one-hot compatibility shim.
-  Production code should register a Tenstorrent sampler backend via
-  `sglang.srt.layers.sampler.register_sampler_backend` and skip materialising
-  full logits at the host boundary.
 - **Mock vocab size.** Set to 131072 so the mock fits the DeepSeek-R1
   tokenizer (vocab 129,280). Adjust `mock_model/config.json` if you need to
   match a different tokenizer.

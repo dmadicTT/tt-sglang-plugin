@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-from importlib.util import find_spec
 
 
 def activate() -> str | None:
-    """Return the Tenstorrent SRT platform class when TT-NN is available."""
-    if find_spec("ttnn") is None and os.getenv("SGLANG_TENSTORRENT_MOCK") != "1":
+    """Return the Tenstorrent SRT platform class when the plugin is enabled."""
+    if os.getenv("SGLANG_TENSTORRENT_MOCK") != "1":
         return None
     return "sglang_tenstorrent.platform.TenstorrentPlatform"
 
