@@ -26,7 +26,7 @@ single-user greedy decoding, and tears the server down on exit.
 ./bench.sh
 ```
 
-**4. Read the output.** The mock's `forward()` sleeps for a known time —
+**4. Read the output.** The mock's `forward()` busy-waits for a known time —
 `1000 / mock_tsu` milliseconds per token. Default `mock_tsu = 500`, so the
 **expected TPOT/ITL is 2 ms / token**. Anything above that is SGLang's
 per-token overhead:
@@ -38,13 +38,13 @@ overhead = reported Median TPOT − (1000 / TSU)
 For example, if `./bench.sh` reports:
 
 ```
-Median TPOT (ms):  2.45
+Median TPOT (ms):  2.30
 ```
 
 then
 
 ```
-overhead = 2.45 − 2.00 = 0.45 ms / token
+overhead = 2.30 − 2.00 = 0.30 ms / token
 ```
 
 That's SGLang's scheduler floor at single-user on this host.

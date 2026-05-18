@@ -82,7 +82,12 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         del input_ids, positions
 
-        time.sleep(self.token_delay_seconds)
+        # Busy-wait, not time.sleep: on Linux time.sleep overshoots by a
+        # constant ~50 µs that would land in the measured per-token overhead.
+        # Busy-wait pegs a core but lands on the deadline to within ~0.1 µs.
+        deadline = time.perf_counter() + self.token_delay_seconds
+        while time.perf_counter() < deadline:
+            pass
 
         req_pool_indices = forward_batch.req_pool_indices.detach().cpu().tolist()
         request_keys = forward_batch.rids or req_pool_indices
@@ -95,7 +100,6 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
             self._logits_buffer[row, tok] = -1.0e9
         self._last_writes.clear()
 
-        chosen: list[int] = []
         for row, request_key in enumerate(request_keys):
             generated = self._generated_by_request.get(request_key, 0)
             token_id = self._sample_next_token_on_device(generated)
@@ -105,15 +109,6 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
             # Tenstorrent will already have sampled token IDs on device.
             self._logits_buffer[row, token_id] = 0.0
             self._last_writes.append((row, token_id))
-            chosen.append(token_id)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "forward: batch=%d keys=%s tokens=%s",
-                batch_size,
-                request_keys if batch_size <= 4 else f"{request_keys[:4]}...",
-                chosen if batch_size <= 4 else f"{chosen[:4]}...",
-            )
 
         return LogitsProcessorOutput(
             next_token_logits=self._logits_buffer[:batch_size]

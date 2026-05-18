@@ -11,11 +11,12 @@ CPU path.
 ## Scope: single user only
 
 This setup is **not** suitable for multi-user / batched throughput analysis.
-The mock's `forward()` sleeps for a fixed `1 / mock_tsu` regardless of batch
-size, so a batch of N concurrent requests still costs one sleep and produces
-N tokens — implying that per-token wall-clock drops as `1 / N`. A real model's
-forward time grows with batch size, so the mock's concurrent-user numbers
-would be wildly optimistic. All measurements below are at concurrency = 1.
+The mock's `forward()` busy-waits for a fixed `1 / mock_tsu` regardless of
+batch size, so a batch of N concurrent requests still costs one wait and
+produces N tokens — implying that per-token wall-clock drops as `1 / N`. A
+real model's forward time grows with batch size, so the mock's
+concurrent-user numbers would be wildly optimistic. All measurements below
+are at concurrency = 1.
 
 ## Method
 
@@ -23,16 +24,22 @@ We isolate scheduler cost by giving SGLang a model whose forward time is a
 known, tunable constant.
 
 The mock model (`sglang_tenstorrent/models/deepseek_r1_0528.py`) implements
-`forward()` as:
+`forward()` as a busy-wait:
 
 ```python
-time.sleep(1.0 / mock_tsu)   # mock_tsu = tokens / sec / user
+deadline = time.perf_counter() + 1.0 / mock_tsu   # mock_tsu = tokens / sec / user
+while time.perf_counter() < deadline:
+    pass
 # fill a cached logits buffer, return it
 ```
 
 - `mock_tsu = 500` → forward floor = **2.0 ms / token**
 - `mock_tsu = 1000` → forward floor = **1.0 ms / token**
 - etc.
+
+A busy-wait (not `time.sleep`) is intentional: `time.sleep` on Linux
+overshoots by a constant ~50 µs that would land in the measured overhead.
+Busy-wait pegs one core but hits the deadline to within ~0.1 µs.
 
 Everything else in SGLang runs unchanged: scheduler subprocess, tokenizer
 manager, detokenizer subprocess, ZMQ IPC, sampler, KV pool bookkeeping, HTTP
@@ -63,17 +70,17 @@ overhead_per_token  =  median TPOT  −  1 / mock_tsu
   no-ops on CPU per `scheduler.py:1502-1503`), so the scheduler tick is
   exposed serially. The measurement is exactly what a CPU user pays.
 
-## Measured floor: ~0.45 ms / token
+## Measured floor: ~0.30 ms / token
 
 `vllm bench serve` at concurrency = 1, ISL = 128, OSL = 2048, 4 prompts,
 TSU = 500 (forward floor = 2.0 ms / token):
 
 | Client config              | Median TPOT | Overhead vs floor |
 | -------------------------- | ----------: | ----------------: |
-| `--temperature 0` (greedy) |     2.45 ms |          +0.45 ms |
-| default (no temperature)   |     2.46 ms |          +0.46 ms |
+| `--temperature 0` (greedy) |     2.30 ms |          +0.30 ms |
+| default (no temperature)   |     2.30 ms |          +0.30 ms |
 
-Both rows collapse to **~0.45 ms** because the plugin installs
+Both rows collapse to **~0.30 ms** because the plugin installs
 `TenstorrentSampler` (`sglang_tenstorrent/sampler.py`), which always returns
 `argmax(logits)` and ignores the client's `temperature` / `top_p` / `top_k`.
 That mirrors real Tenstorrent serving — the device samples on-chip, so
@@ -83,18 +90,17 @@ work (see *Sampling* below).
 
 ## Caveats
 
-1. **`time.sleep()` granularity is ~1 ms on Linux.** Don't trust the floor
-   above `mock_tsu ≈ 1000` (sub-ms sleeps become jittery). For tighter
-   measurements, switch to a busy-wait inside `forward()`.
-2. **`time.sleep()` releases the GIL.** Today's scheduler loop is
-   single-threaded so this doesn't hide work, but it would if background
-   threads were added.
-3. **CPU-engine overhead ≠ GPU-engine overhead.** On GPU most of this work
+1. **Busy-wait pegs a core.** The mock's `forward()` spins on
+   `time.perf_counter()` for the full `1 / mock_tsu` seconds, holding one
+   CPU core at 100%. Fine on a multi-core box where the SGLang scheduler /
+   tokenizer / detokenizer processes can use other cores; would distort the
+   measurement on a single-core box or one already CPU-saturated.
+2. **CPU-engine overhead ≠ GPU-engine overhead.** On GPU most of this work
    overlaps with kernel execution and is invisible. The number here is the
    floor that becomes exposed *if* device forwards are faster than the
    scheduler tick — useful for understanding when scheduler cost will
    bottleneck a fast backend.
-4. **Single-user only.** See the *Scope* section above. Do not extrapolate
+3. **Single-user only.** See the *Scope* section above. Do not extrapolate
    the reported number to concurrent-user TPOT; the mock can't model
    batch-dependent forward time.
 
@@ -139,5 +145,5 @@ SAMPLING=default ./bench.sh
 ```
 
 Read **Median TPOT** from the output. Scheduler overhead =
-`Median TPOT − 1000 / TSU` (ms). At TSU=500 expect ~2.45 ms TPOT → ~0.45 ms
+`Median TPOT − 1000 / TSU` (ms). At TSU=500 expect ~2.30 ms TPOT → ~0.30 ms
 overhead. Always at concurrency = 1 by design — see *Scope* above.

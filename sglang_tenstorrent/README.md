@@ -37,7 +37,7 @@ plugin is a no-op. `serve.sh` sets it.
 | --- | --- |
 | `__init__.py` | Entry points, activation gate, startup hook. |
 | `platform.py` | Platform adapter: memory, attention backend default, KV / paged allocator. |
-| `models/deepseek_r1_0528.py` | Mock model: `forward()` sleeps `1 / mock_tsu` s, returns synthetic logits. |
+| `models/deepseek_r1_0528.py` | Mock model: `forward()` busy-waits `1 / mock_tsu` s, returns synthetic logits. |
 | `deepseek_r1_0528.py` | Helpers for identifying the bundled mock by path. |
 | `sampler.py` | `TenstorrentSampler` — always returns `argmax(logits)`, modeling on-device sampling. |
 | `mock_model/config.json` | Mock config (vocab=131072 to fit DeepSeek-R1, `mock_tsu`, max generated tokens). |
@@ -47,7 +47,7 @@ plugin is a no-op. `serve.sh` sets it.
 | Env var | Default | Effect |
 | --- | --- | --- |
 | `SGLANG_TENSTORRENT_MOCK` | unset | Must be `1` for the plugin to activate. |
-| `SGLANG_TENSTORRENT_MOCK_TSU` | 500 (from `mock_model/config.json`) | Tokens/sec/user. Mock sleeps `1 / TSU` per forward. |
+| `SGLANG_TENSTORRENT_MOCK_TSU` | 500 (from `mock_model/config.json`) | Tokens/sec/user. Mock busy-waits `1 / TSU` per forward. |
 | `SGLANG_TENSTORRENT_MOCK_LOG` | unset | `info` or `debug` enables mock-model log lines. |
 
 `--max-total-tokens` must be set when serving: the mock's `hidden_size=1`
