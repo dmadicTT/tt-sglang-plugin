@@ -78,6 +78,38 @@ By sweeping `mock_tsu` and concurrency we separate three components:
    produces 32 tokens → per-token overhead drops ~32×. Always report the
    concurrency the number was measured at.
 
+## Sampling defaults dominate the reported overhead
+
+This script drives `/v1/chat/completions` via `sglang.bench_serving --backend
+sglang-oai-chat`, which injects `temperature=0` into every request
+(`bench_serving.py:404-405`). That short-circuits the sampler to argmax. Other
+benchmark tools (`vllm bench`, `guidellm`) **do not** set temperature, so the
+server falls through to the full sampling pipeline (top-p / top-k / multinomial)
+over the full vocab (131 072 entries for DeepSeek-R1).
+
+Same server, same workload (ISL=128, OSL=1000, concurrency=1, TSU=500),
+single-stream curl in **non-streaming** mode (so no client/network involved):
+
+| Sampling                       | Wall-clock for 1000 tokens | TPOT     | Overhead vs 2 ms floor |
+| ------------------------------ | -------------------------: | -------: | ---------------------: |
+| `temperature=0` (greedy)       |                  2446.3 ms |  2.45 ms |               +0.45 ms |
+| server default (full sampling) |                  4675.9 ms |  4.68 ms |               +2.68 ms |
+
+The ~2.2 ms gap is pure server-side sampler cost on CPU; it has nothing to do
+with the client. That also explains the apparent gap between tools:
+
+| Client                                | Sampling            | Median TPOT |
+| ------------------------------------- | ------------------- | ----------: |
+| `sglang.bench_serving` (this script)  | injects `temp=0`    |     2.45 ms |
+| `vllm bench --backend openai-chat`    | server default      |     4.61 ms |
+| `guidellm --backend openai_http`      | server default      |     4.70 ms |
+| `curl` (greedy)                       | `temperature: 0`    |     2.45 ms |
+| `curl` (default)                      | server default      |     4.68 ms |
+
+So this script measures **SGLang's scheduler floor in isolation** (~0.5 ms)
+by stripping out the sampler. For an end-user TPOT estimate on DeepSeek-R1
+with realistic sampling, add the **~2.2 ms sampler cost** on top.
+
 ## Running it
 
 The bench script handles server lifecycle, port allocation, and metric
