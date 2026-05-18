@@ -15,22 +15,47 @@ hardware -- useful for measuring SGLang's per-token overhead.
 
 ## Install
 
-The plugin is distributed as source only -- install it from a checkout of this
-repository. SGLang itself comes from PyPI in the typical case (see below for
-the CPU caveat).
-
-The commands below use [`uv`](https://docs.astral.sh/uv/); plain `pip` works
-identically (drop the `uv ` prefix). `uv pip` auto-discovers a `.venv` in the
-current directory, so no manual activation is needed.
+Tenstorrent hosts typically have no NVIDIA driver and so cannot import the
+standard SGLang wheel (its `sgl_kernel` dlopens `libcuda.so.1` at module load).
+SGLang does not publish a CPU wheel on PyPI, so both SGLang and its kernel
+package must be built from source. The recipe below is what we use; commands
+use [`uv`](https://docs.astral.sh/uv/) (`pip` works identically if you prefer).
 
 ```bash
-# 1. create a venv (skip if you already have one)
-uv venv
+# 1. checkout SGLang (any tag >= v0.5.11 -- platforms/plugins APIs need to exist)
+git clone --depth 1 --branch v0.5.11 https://github.com/sgl-project/sglang.git
 
-# 2. install sglang into it (see "SGLang setup" below for the CPU caveat)
-uv pip install --prerelease=allow 'sglang>=0.5.11'
+# 2. create a Python 3.12 venv -- the CPU kernel .so is built per-ABI, the
+#    venv's Python must match what you build against
+uv venv --python 3.12
+source .venv/bin/activate
 
-# 3. install this plugin from a checkout
+# 3. install CPU torch + build deps
+uv pip install \
+    --index https://download.pytorch.org/whl/cpu \
+    --index https://pypi.org/simple \
+    --index-strategy unsafe-best-match \
+    'torch==2.9.0' scikit-build-core 'setuptools>=64' wheel ninja cmake
+
+# 4. build sglang-cpu: swap in the CPU pyproject, install, restore
+pushd sglang/python
+cp pyproject.toml pyproject.toml.bak && cp pyproject_cpu.toml pyproject.toml
+uv pip install --no-build-isolation \
+    --index https://download.pytorch.org/whl/cpu \
+    --index https://pypi.org/simple \
+    --index-strategy unsafe-best-match \
+    .
+mv pyproject.toml.bak pyproject.toml
+popd
+
+# 5. build sglang-kernel-cpu (compiles C++, ~40 s on a normal host)
+pushd sglang/sgl-kernel
+cp pyproject.toml pyproject.toml.bak && cp pyproject_cpu.toml pyproject.toml
+uv pip install --no-build-isolation .
+mv pyproject.toml.bak pyproject.toml
+popd
+
+# 6. install this plugin from a checkout
 git clone <this-repo> tt-sglang-plugin
 uv pip install -e ./tt-sglang-plugin
 ```
@@ -39,28 +64,13 @@ There's no global registration step. The plugin advertises two entry points
 (`sglang.srt.platforms` and `sglang.srt.plugins`) which SGLang discovers
 automatically when it starts.
 
-### SGLang setup
-
-**GPU host, or any host with `libcuda.so.1` available:** the standard SGLang
-wheel works fine, including for the bundled mock model -- the mock just sleeps,
-so the GPU is never actually exercised.
+Smoke-check the install:
 
 ```bash
-uv pip install --prerelease=allow 'sglang>=0.5.11'   # --prerelease=allow is currently required by sglang's flash-attn-4 dep
+SGLANG_TENSTORRENT_MOCK=1 python -c \
+  "import sglang_tenstorrent; print(sglang_tenstorrent.activate())"
+# expect: sglang_tenstorrent.platform.TenstorrentPlatform
 ```
-
-You can run the mock with `--device cuda` (it allocates a trivial logits tensor
-on the GPU and otherwise does nothing) or `--device cpu`.
-
-**CPU-only host (no `libcuda.so.1`):** the standard SGLang wheel cannot be
-imported -- its `sgl_kernel` dependency loads CUDA libraries at module-import
-time and refuses to fall through. There is no `sglang-cpu` wheel on PyPI; the
-CPU build has to be compiled from source. Follow
-[`docs/platforms/cpu_server.md`][cpu-docs] in the SGLang repository. Once
-`import sglang` works in your environment the plugin install above is
-unchanged.
-
-[cpu-docs]: https://github.com/sgl-project/sglang/blob/main/docs/platforms/cpu_server.md
 
 ## How activation works
 
