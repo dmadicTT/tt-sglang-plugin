@@ -19,11 +19,20 @@ The plugin is distributed as source only -- install it from a checkout of this
 repository. SGLang itself comes from PyPI in the typical case (see below for
 the CPU caveat).
 
+The commands below use [`uv`](https://docs.astral.sh/uv/); plain `pip` works
+identically (drop the `uv ` prefix). `uv pip` auto-discovers a `.venv` in the
+current directory, so no manual activation is needed.
+
 ```bash
-# 1. install sglang in your environment (see "SGLang setup" below for options)
-# 2. install this plugin from a checkout
+# 1. create a venv (skip if you already have one)
+uv venv
+
+# 2. install sglang into it (see "SGLang setup" below for the CPU caveat)
+uv pip install --prerelease=allow 'sglang>=0.5.11'
+
+# 3. install this plugin from a checkout
 git clone <this-repo> tt-sglang-plugin
-pip install -e ./tt-sglang-plugin
+uv pip install -e ./tt-sglang-plugin
 ```
 
 There's no global registration step. The plugin advertises two entry points
@@ -37,7 +46,7 @@ wheel works fine, including for the bundled mock model -- the mock just sleeps,
 so the GPU is never actually exercised.
 
 ```bash
-pip install --pre 'sglang>=0.5.11'   # --pre is currently required by sglang's flash-attn-4 dependency
+uv pip install --prerelease=allow 'sglang>=0.5.11'   # --prerelease=allow is currently required by sglang's flash-attn-4 dep
 ```
 
 You can run the mock with `--device cuda` (it allocates a trivial logits tensor
@@ -77,10 +86,21 @@ active environment, `sglang serve` picks it up.
 ## Run the bundled mock
 
 The mock's `forward()` sleeps `1 / mock_tsu` seconds per call and returns a
-fixed token id. `mock_tsu` is **tokens per second per user** -- for example,
+synthetic token id. `mock_tsu` is **tokens per second per user** -- for example,
 `mock_tsu=500` ⇒ 2 ms / token, `mock_tsu=1000` ⇒ 1 ms / token. The default
 lives in `sglang_tenstorrent/mock_model/config.json` (currently `500.0`) and
 can be overridden at runtime by setting `SGLANG_TENSTORRENT_MOCK_TSU`.
+
+There's a `serve.sh` wrapper at the repo root that fills in the right flags:
+
+```bash
+./serve.sh                                       # CPU defaults, port 30050
+PORT=30001 ./serve.sh                            # custom port
+SGLANG_TENSTORRENT_MOCK_TSU=1000 ./serve.sh      # 1 ms / token floor
+./serve.sh --tp-size 2                           # extra flags forward to sglang
+```
+
+The full `sglang serve` invocation it produces:
 
 ```bash
 MOCK_MODEL=$(python -c "from sglang_tenstorrent.deepseek_r1_0528 import deepseek_r1_0528_mock_model_path; print(deepseek_r1_0528_mock_model_path())")
@@ -90,9 +110,9 @@ SGLANG_TENSTORRENT_MOCK_TSU=500 \
   sglang serve \
     --model-path "$MOCK_MODEL" \
     --served-model-name deepseek-ai/DeepSeek-R1-0528 \
+    --tokenizer-path deepseek-ai/DeepSeek-R1-0528 \
     --load-format dummy \
     --device cpu \
-    --skip-tokenizer-init \
     --max-total-tokens 8192
 ```
 
@@ -102,13 +122,40 @@ to allocate billions of slots and OOMs.
 
 Verify with `GET /v1/models` -- you should see `deepseek-ai/DeepSeek-R1-0528`.
 
+### Enable mock-model logs
+
+Set `SGLANG_TENSTORRENT_MOCK_LOG` to see what the mock is doing -- one INFO
+line per `__init__` plus one DEBUG line per `forward()` (batch size, request
+keys, chosen token ids):
+
+```bash
+SGLANG_TENSTORRENT_MOCK_LOG=info  ./serve.sh    # init only
+SGLANG_TENSTORRENT_MOCK_LOG=debug ./serve.sh    # init + every forward()
+SGLANG_TENSTORRENT_MOCK_LOG=1     ./serve.sh    # alias for debug
+```
+
+The handler is installed on the mock model's logger with
+`propagate=False`, so the extra lines don't go through SGLang's root logger
+and can't trigger double-printing.
+
 ## Run the streaming-overhead benchmark
 
-`bench/run_streaming_overhead.py` (in the repository root) starts the mock,
-runs `sglang.bench_serving` against it, and reports ITL against the mock's
-known per-token sleep floor. Pass `--tsu N` to override `mock_tsu` for a
-single run (the script propagates it to the server via the env var). See the
-script's module docstring for the full methodology and known limitations.
+A `bench.sh` wrapper at the repo root forwards everything to
+`bench/run_streaming_overhead.py`:
+
+```bash
+./bench.sh                                          # 4 prompts × 2048 tokens, concurrency 1
+./bench.sh --tsu 1000                               # 1 ms / token floor
+./bench.sh --concurrency 8 --num-prompts 16         # under load
+./bench.sh --output-len 4096 --context-length 8192  # longer streams
+./bench.sh --help                                   # full flag list
+```
+
+The script starts the mock, runs `sglang.bench_serving` against it, and prints
+ITL against the mock's known per-token sleep floor. `--tsu` overrides
+`mock_tsu` for a single run (the script propagates it to the server via
+`SGLANG_TENSTORRENT_MOCK_TSU`). See the Python script's module docstring for
+the full methodology and known limitations.
 
 ## Real Tenstorrent inference
 

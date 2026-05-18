@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Iterable
@@ -13,6 +14,28 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 MOCK_TSU_ENV = "SGLANG_TENSTORRENT_MOCK_TSU"
+MOCK_LOG_ENV = "SGLANG_TENSTORRENT_MOCK_LOG"
+
+logger = logging.getLogger(__name__)
+
+
+def _configure_logger() -> None:
+    raw = os.environ.get(MOCK_LOG_ENV, "").strip().lower()
+    if not raw or raw in ("0", "false", "no"):
+        return
+    level = logging.INFO if raw == "info" else logging.DEBUG
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(name)s [%(levelname)s] %(message)s")
+        )
+        logger.addHandler(handler)
+        logger.propagate = False
+
+
+_configure_logger()
 
 
 def _resolve_mock_tsu(config) -> float:
@@ -37,6 +60,19 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
         self.mock_tsu = _resolve_mock_tsu(config)
         self.token_delay_seconds = 1.0 / self.mock_tsu
         self._generated_by_request: dict[str | int, int] = {}
+        # Logits buffer cached across forward() calls; allocated lazily so we
+        # see the actual device. _last_writes tracks which (row, token_id) cells
+        # we set to 0.0 last call so we can reset them back to -1e9 cheaply.
+        self._logits_buffer: torch.Tensor | None = None
+        self._last_writes: list[tuple[int, int]] = []
+        logger.info(
+            "mock model init: tsu=%.3f tokens/sec/user, delay=%.6f s, "
+            "vocab_size=%d, max_generated_tokens=%d",
+            self.mock_tsu,
+            self.token_delay_seconds,
+            self.vocab_size,
+            self.max_generated_tokens,
+        )
 
     def forward(
         self,
@@ -47,15 +83,19 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
         del input_ids, positions
 
         time.sleep(self.token_delay_seconds)
+
         req_pool_indices = forward_batch.req_pool_indices.detach().cpu().tolist()
         request_keys = forward_batch.rids or req_pool_indices
-        logits = torch.full(
-            (len(req_pool_indices), self.vocab_size),
-            -1.0e9,
-            dtype=torch.float32,
-            device=forward_batch.seq_lens.device,
-        )
+        batch_size = len(req_pool_indices)
+        device = forward_batch.seq_lens.device
 
+        self._ensure_logits_buffer(batch_size, device)
+        # Reset cells we wrote on the previous call (no-op on a fresh buffer).
+        for row, tok in self._last_writes:
+            self._logits_buffer[row, tok] = -1.0e9
+        self._last_writes.clear()
+
+        chosen: list[int] = []
         for row, request_key in enumerate(request_keys):
             generated = self._generated_by_request.get(request_key, 0)
             token_id = self._sample_next_token_on_device(generated)
@@ -63,13 +103,46 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
                 self._generated_by_request[request_key] = generated + 1
             # Compatibility shim: SGLang currently samples from logits, while
             # Tenstorrent will already have sampled token IDs on device.
-            logits[row, token_id] = 0.0
+            self._logits_buffer[row, token_id] = 0.0
+            self._last_writes.append((row, token_id))
+            chosen.append(token_id)
 
-        return LogitsProcessorOutput(next_token_logits=logits)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "forward: batch=%d keys=%s tokens=%s",
+                batch_size,
+                request_keys if batch_size <= 4 else f"{request_keys[:4]}...",
+                chosen if batch_size <= 4 else f"{chosen[:4]}...",
+            )
+
+        return LogitsProcessorOutput(
+            next_token_logits=self._logits_buffer[:batch_size]
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         for _ in weights:
             pass
+
+    def _ensure_logits_buffer(self, batch_size: int, device: torch.device) -> None:
+        if (
+            self._logits_buffer is None
+            or self._logits_buffer.shape[0] < batch_size
+            or self._logits_buffer.device != device
+        ):
+            capacity = max(batch_size, 64)
+            self._logits_buffer = torch.full(
+                (capacity, self.vocab_size),
+                -1.0e9,
+                dtype=torch.float32,
+                device=device,
+            )
+            # Fresh buffer -- any tracked writes pointed at the old one.
+            self._last_writes.clear()
+            logger.debug(
+                "allocated logits buffer: shape=%s device=%s",
+                tuple(self._logits_buffer.shape),
+                device,
+            )
 
     def _sample_next_token_on_device(self, generated: int) -> int:
         if generated >= self.max_generated_tokens:
