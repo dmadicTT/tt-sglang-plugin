@@ -3,47 +3,66 @@
 Out-of-tree SGLang plugin that registers Tenstorrent as an SRT platform and
 ships a CPU mock model for measuring SGLang's per-token serving overhead.
 
-## Install
+## Quick start
+
+**1. Clone the repo.**
+
+```bash
+git clone https://github.com/dmadicTT/tt-sglang-plugin.git
+cd tt-sglang-plugin
+```
+
+**2. Install.** Builds CPU-only SGLang from source and installs the plugin
+into `./.venv`. Requires `uv`, `git`, and a C++ toolchain.
 
 ```bash
 ./install.sh
-source .venv/bin/activate
 ```
 
-[`install.sh`](install.sh) builds CPU-only SGLang from source and installs
-this plugin editable into a fresh venv at `./.venv`. Idempotent — re-running
-reuses an existing venv and sglang checkout. Requires `uv`, `git`, and a C++
-toolchain. Override defaults via `VENV_DIR`, `SGLANG_REPO`, `SGLANG_TAG`.
-
-## Serve the mock model
+**3. Run the benchmark.** Starts the bundled mock, runs `vllm bench serve` at
+single-user greedy decoding, and tears the server down on exit.
 
 ```bash
-./serve.sh                                     # port 30050, mock_tsu=500
-SGLANG_TENSTORRENT_MOCK_TSU=1000 ./serve.sh    # tighter per-token floor
+./bench.sh
 ```
 
-The mock's `forward()` sleeps `1 / mock_tsu` seconds and returns synthetic
-logits, giving SGLang a backend with a known, tunable forward cost.
+**4. Read the output.** The mock's `forward()` sleeps for a known time —
+`1000 / mock_tsu` milliseconds per token. Default `mock_tsu = 500`, so the
+**expected TPOT/ITL is 2 ms / token**. Anything above that is SGLang's
+per-token overhead:
 
-## Benchmark SGLang's per-token overhead
-
-```bash
-./bench.sh                                     # canonical greedy bench
-TSU=200 ./bench.sh                             # different forward floor
-SAMPLING=default ./bench.sh                    # client default sampling
+```
+overhead = reported Median TPOT − (1000 / TSU)
 ```
 
-[`bench.sh`](bench.sh) starts the mock server, runs `vllm bench serve` at
-single-user against `/v1/chat/completions`, and tears the server down on
-exit. Subtract `1000 / TSU` ms from the reported Median TPOT to read off
-SGLang's scheduler floor — currently **~0.45 ms / token**. See
-[`HOW_WE_MEASURE_OVERHEAD.md`](HOW_WE_MEASURE_OVERHEAD.md) for the methodology and the on-device
-sampling shim that makes the number invariant to client sampling config.
+For example, if `./bench.sh` reports:
 
-## Plugin code
+```
+Median TPOT (ms):  2.45
+```
 
-[`sglang_tenstorrent/`](sglang_tenstorrent/) contains the plugin: SRT
-platform adapter, mock model, and the `tenstorrent` sampling backend.
-SGLang auto-discovers it through Python entry points when the venv has it
-installed. See [`sglang_tenstorrent/README.md`](sglang_tenstorrent/README.md)
-for the activation contract and a per-file map.
+then
+
+```
+overhead = 2.45 − 2.00 = 0.45 ms / token
+```
+
+That's SGLang's scheduler floor at single-user on this host.
+
+## Variations
+
+- **Tighter forward floor.** `TSU=1000 ./bench.sh` → 1 ms / token expected.
+- **Client default sampling** (top-p / top-k / multinomial instead of greedy):
+  `SAMPLING=default ./bench.sh`. The result should be the same, because the
+  plugin's on-device sampling shim makes TPOT invariant to client sampling
+  config.
+- **Pass-through args to `vllm bench serve`:**
+  `./bench.sh --random-output-len 1024 --num-prompts 8`.
+
+## Going deeper
+
+- Methodology, the on-device sampling shim, caveats, and limits of the
+  measurement: [`HOW_WE_MEASURE_OVERHEAD.md`](HOW_WE_MEASURE_OVERHEAD.md).
+- Plugin internals (activation contract, file map, mock env vars):
+  [`sglang_tenstorrent/`](sglang_tenstorrent/) and its
+  [README](sglang_tenstorrent/README.md).
