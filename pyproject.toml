@@ -7,7 +7,7 @@ name = "sglang-tenstorrent"
 version = "0.0.0"
 description = "Tenstorrent hardware platform plugin for SGLang."
 requires-python = ">=3.10"
-dependencies = ["sglang"]
+dependencies = ["sglang>=0.5.11"]
 
 [project.entry-points."sglang.srt.platforms"]
 tenstorrent = "sglang_tenstorrent:activate"
