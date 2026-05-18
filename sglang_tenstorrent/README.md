@@ -55,8 +55,9 @@ tenstorrent = "sglang_tenstorrent:register"
 At server startup SGLang discovers them automatically. `activate()` returns
 the Tenstorrent platform class when `SGLANG_TENSTORRENT_MOCK=1` is set;
 otherwise it returns `None` and SGLang ignores the plugin. `register()` adds
-the Tenstorrent model package to `ModelRegistry` and wires the
-`served_model_name` startup hook.
+the Tenstorrent model package to `ModelRegistry`, registers the `tenstorrent`
+sampling backend, and wires the startup hook that pins `served_model_name`
+and `sampling_backend` for the mock.
 
 There is no global configuration step -- if the package is installed in the
 active environment, `sglang serve` picks it up.
@@ -143,6 +144,7 @@ the full methodology and known limitations.
 | `platform.py` | Hardware adapter: memory reporting, attention backend default, KV pool / paged allocator classes. |
 | `models/deepseek_r1_0528.py` | Mock model adapter (sleep-based, returns synthetic token ids). |
 | `deepseek_r1_0528.py` | Helpers and paths for the bundled mock. |
+| `sampler.py` | `Sampler` subclass that returns `argmax(logits)`; registered as the `tenstorrent` sampling backend. |
 | `mock_model/config.json` | Mock model config (vocab size, per-forward delay, etc.). |
 
 ## Notes
@@ -150,3 +152,12 @@ the full methodology and known limitations.
 - **Mock vocab size.** Set to 131072 so the mock fits the DeepSeek-R1
   tokenizer (vocab 129,280). Adjust `mock_model/config.json` if you need to
   match a different tokenizer.
+- **Sampling backend.** The plugin registers a `tenstorrent` sampling backend
+  that returns `argmax(logits)` and skips the ~2 ms host softmax+sort+
+  multinomial that the default `pytorch` backend would burn over the 131k
+  DeepSeek vocab. The mock writes a one-hot logits row keyed at the
+  device-sampled token id, so argmax recovers it in ~50 µs. The mock-identity
+  hook re-pins `sampling_backend = "tenstorrent"` after the fact because
+  `ServerArgs._handle_cpu_backends` unconditionally clobbers it to `"pytorch"`
+  on CPU. Real Tenstorrent hardware samples on-die — the full host sampler is
+  a CPU artifact, not a production cost.
