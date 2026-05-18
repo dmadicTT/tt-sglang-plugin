@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Iterable
 
@@ -10,6 +11,19 @@ from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+MOCK_TSU_ENV = "SGLANG_TENSTORRENT_MOCK_TSU"
+
+
+def _resolve_mock_tsu(config) -> float:
+    env_value = os.environ.get(MOCK_TSU_ENV)
+    raw = env_value if env_value else getattr(config, "mock_tsu", 500.0)
+    tsu = float(raw)
+    if tsu <= 0:
+        raise ValueError(
+            f"mock_tsu must be > 0 (got {tsu!r}); set {MOCK_TSU_ENV} or mock_tsu in config.json"
+        )
+    return tsu
 
 
 class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
@@ -20,7 +34,8 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
         self.vocab_size = getattr(config, "vocab_size", 256)
         self.eos_token_id = getattr(config, "eos_token_id", 2)
         self.max_generated_tokens = getattr(config, "mock_max_generated_tokens", 16)
-        self.token_delay_seconds = getattr(config, "mock_token_delay_seconds", 0.02)
+        self.mock_tsu = _resolve_mock_tsu(config)
+        self.token_delay_seconds = 1.0 / self.mock_tsu
         self._generated_by_request: dict[str | int, int] = {}
 
     def forward(

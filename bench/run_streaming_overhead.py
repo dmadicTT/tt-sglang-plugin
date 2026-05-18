@@ -1,12 +1,14 @@
 """Measure SGLang per-token streaming overhead against the Tenstorrent mock model.
 
-The mock's `forward()` calls `time.sleep(mock_token_delay_seconds)` so the per-token
-floor is known. Anything the bench reports above that floor is SGLang overhead
+The mock's `forward()` calls `time.sleep(1 / mock_tsu)` so the per-token floor
+is known. `mock_tsu` is tokens per second per user; e.g. tsu=500 ⇒ 2 ms /
+token. Anything the bench reports above that floor is SGLang overhead
 (scheduler dispatch, IPC between tokenizer/scheduler/detokenizer, HTTP streaming,
 etc).
 
 Usage:
     .venv/bin/python bench/run_streaming_overhead.py
+    .venv/bin/python bench/run_streaming_overhead.py --tsu 1000   # 1 ms / token floor
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ PLUGIN_PACKAGE = REPO_ROOT / "sglang_tenstorrent"
 MOCK_MODEL_DIR = PLUGIN_PACKAGE / "mock_model"
 SERVED_MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528"
 SERVER_READY_LINE = "The server is fired up and ready to roll"
+MOCK_TSU_ENV = "SGLANG_TENSTORRENT_MOCK_TSU"
 
 
 def pick_free_port() -> int:
@@ -46,9 +49,15 @@ def pick_free_port() -> int:
     raise RuntimeError("could not find a free port in [20000, 55000)")
 
 
-def read_mock_delay_ms() -> float:
+def resolve_mock_tsu(cli_tsu: float | None) -> float:
+    """Pick mock_tsu using the same precedence as the model: CLI > env > config.json."""
+    if cli_tsu is not None:
+        return cli_tsu
+    env_value = os.environ.get(MOCK_TSU_ENV)
+    if env_value:
+        return float(env_value)
     config = json.loads((MOCK_MODEL_DIR / "config.json").read_text())
-    return float(config["mock_token_delay_seconds"]) * 1000.0
+    return float(config["mock_tsu"])
 
 
 def wait_until_ready(log_path: Path, server: subprocess.Popen, timeout_s: float) -> None:
@@ -69,13 +78,14 @@ def wait_until_ready(log_path: Path, server: subprocess.Popen, timeout_s: float)
     raise TimeoutError(f"sglang serve did not signal ready within {timeout_s}s; see {log_path}")
 
 
-def start_server(port: int, log_path: Path, max_total_tokens: int, context_length: int) -> subprocess.Popen:
+def start_server(port: int, log_path: Path, max_total_tokens: int, context_length: int, mock_tsu: float) -> subprocess.Popen:
     env = os.environ.copy()
     env.update(
         SGLANG_TENSTORRENT_MOCK="1",
         SGLANG_USE_CPU_ENGINE="1",
         SGLANG_PLATFORM="tenstorrent",
     )
+    env[MOCK_TSU_ENV] = repr(mock_tsu)
     venv_bin = Path(sys.executable).parent
     sglang_cli = venv_bin / "sglang"
     cmd = [
@@ -90,7 +100,7 @@ def start_server(port: int, log_path: Path, max_total_tokens: int, context_lengt
         "--device",
         "cpu",
         "--tokenizer-path",
-        "gpt2",
+        SERVED_MODEL_NAME,
         "--host",
         "127.0.0.1",
         "--port",
@@ -126,7 +136,7 @@ def run_bench(port: int, num_prompts: int, output_len: int, concurrency: int) ->
         "--model",
         SERVED_MODEL_NAME,
         "--tokenizer",
-        "gpt2",
+        SERVED_MODEL_NAME,
         "--dataset-name",
         "random-ids",
         "--random-input",
@@ -167,15 +177,24 @@ def main() -> int:
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--server-log", type=Path, default=Path("/tmp/sglang-bench-server.log"))
     parser.add_argument("--ready-timeout", type=float, default=180.0)
+    parser.add_argument(
+        "--tsu",
+        type=float,
+        default=None,
+        help=f"mock_tsu (tokens/sec/user). Overrides ${MOCK_TSU_ENV} and config.json.",
+    )
     args = parser.parse_args()
 
     if args.output_len > args.context_length - 64:
         parser.error("output_len must fit inside context_length minus a small prompt")
+    if args.tsu is not None and args.tsu <= 0:
+        parser.error("--tsu must be > 0")
 
     port = args.port or pick_free_port()
-    floor_ms = read_mock_delay_ms()
+    mock_tsu = resolve_mock_tsu(args.tsu)
+    floor_ms = 1000.0 / mock_tsu
 
-    print(f"[bench] mock token delay floor: {floor_ms:.3f} ms / token")
+    print(f"[bench] mock_tsu={mock_tsu:.3f} tokens/sec/user (floor {floor_ms:.3f} ms / token)")
     print(f"[bench] starting sglang serve on 127.0.0.1:{port}, log -> {args.server_log}")
 
     args.server_log.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +205,7 @@ def main() -> int:
         log_path=args.server_log,
         max_total_tokens=args.max_total_tokens,
         context_length=args.context_length,
+        mock_tsu=mock_tsu,
     )
 
     try:

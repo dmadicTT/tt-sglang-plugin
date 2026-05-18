@@ -5,7 +5,7 @@
   ],
   "model_type": "llama",
   "mock_served_model_name": "deepseek-ai/DeepSeek-R1-0528",
-  "vocab_size": 65536,
+  "vocab_size": 131072,
   "hidden_size": 1,
   "intermediate_size": 4,
   "num_hidden_layers": 1,
@@ -16,5 +16,5 @@
   "eos_token_id": 2,
   "pad_token_id": 0,
   "mock_max_generated_tokens": 2048,
-  "mock_token_delay_seconds": 0.002
+  "mock_tsu": 500.0
 }

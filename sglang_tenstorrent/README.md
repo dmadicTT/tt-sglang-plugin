@@ -76,14 +76,17 @@ active environment, `sglang serve` picks it up.
 
 ## Run the bundled mock
 
-The mock's `forward()` sleeps `mock_token_delay_seconds` (default 2 ms) per call
-and returns a fixed token id. Useful for "how much overhead does SGLang itself
-add per token" experiments.
+The mock's `forward()` sleeps `1 / mock_tsu` seconds per call and returns a
+fixed token id. `mock_tsu` is **tokens per second per user** -- for example,
+`mock_tsu=500` ⇒ 2 ms / token, `mock_tsu=1000` ⇒ 1 ms / token. The default
+lives in `sglang_tenstorrent/mock_model/config.json` (currently `500.0`) and
+can be overridden at runtime by setting `SGLANG_TENSTORRENT_MOCK_TSU`.
 
 ```bash
 MOCK_MODEL=$(python -c "from sglang_tenstorrent.deepseek_r1_0528 import deepseek_r1_0528_mock_model_path; print(deepseek_r1_0528_mock_model_path())")
 
 SGLANG_TENSTORRENT_MOCK=1 SGLANG_PLATFORM=tenstorrent \
+SGLANG_TENSTORRENT_MOCK_TSU=500 \
   sglang serve \
     --model-path "$MOCK_MODEL" \
     --served-model-name deepseek-ai/DeepSeek-R1-0528 \
@@ -103,8 +106,9 @@ Verify with `GET /v1/models` -- you should see `deepseek-ai/DeepSeek-R1-0528`.
 
 `bench/run_streaming_overhead.py` (in the repository root) starts the mock,
 runs `sglang.bench_serving` against it, and reports ITL against the mock's
-known per-token sleep floor. See the script's module docstring for the full
-methodology and known limitations.
+known per-token sleep floor. Pass `--tsu N` to override `mock_tsu` for a
+single run (the script propagates it to the server via the env var). See the
+script's module docstring for the full methodology and known limitations.
 
 ## Real Tenstorrent inference
 
@@ -130,6 +134,6 @@ with the real Tenstorrent execution path.
   Production code should register a Tenstorrent sampler backend via
   `sglang.srt.layers.sampler.register_sampler_backend` and skip materialising
   full logits at the host boundary.
-- **Mock vocab size.** Set to 65536 so the mock can be benched with any common
-  public tokenizer (gpt2's vocab is 50257). Adjust `mock_model/config.json` if
-  you need to match a different tokenizer.
+- **Mock vocab size.** Set to 131072 so the mock fits the DeepSeek-R1
+  tokenizer (vocab 129,280). Adjust `mock_model/config.json` if you need to
+  match a different tokenizer.
