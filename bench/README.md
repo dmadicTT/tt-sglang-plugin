@@ -2,10 +2,20 @@
 
 ## Goal
 
-Quantify the per-token wall-clock cost that SGLang's serving stack adds *on top
-of* model compute — i.e. what a backend with arbitrarily fast forwards would
-still pay per generated token. This bounds the throughput ceiling any future
-Tenstorrent backend can reach through SGLang's CPU scheduler path.
+Quantify the **single-user** per-token wall-clock cost that SGLang's serving
+stack adds *on top of* model compute — i.e. what a single in-flight request to
+a backend with arbitrarily fast forwards would still pay per generated token.
+This is the floor of TPOT a single user can ever observe through the SGLang
+CPU path.
+
+## Scope: single user only
+
+This setup is **not** suitable for multi-user / batched throughput analysis.
+The mock's `forward()` sleeps for a fixed `1 / mock_tsu` regardless of batch
+size, so a batch of N concurrent requests still costs one sleep and produces
+N tokens — implying that per-token wall-clock drops as `1 / N`. A real model's
+forward time grows with batch size, so the mock's concurrent-user numbers
+would be wildly optimistic. All measurements below are at concurrency = 1.
 
 ## Method
 
@@ -28,21 +38,15 @@ Everything else in SGLang runs unchanged: scheduler subprocess, tokenizer
 manager, detokenizer subprocess, ZMQ IPC, sampler, KV pool bookkeeping, HTTP
 streaming.
 
-We then drive the server with `sglang.bench_serving` and read **ITL**
-(inter-token latency) and **TPOT** (time per output token, excl. first token).
-The scheduler overhead at a given concurrency is:
+We drive the server with **`vllm bench serve`** against the OpenAI-compatible
+`/v1/chat/completions` endpoint, passing `--temperature 0` to force greedy
+sampling (see the *Sampling* note below for why that is the right comparison
+for DeepSeek). We read **TPOT** (time per output token, excluding the first
+token) and compute:
 
 ```
-overhead_per_token  =  measured_ITL  −  1 / mock_tsu
+overhead_per_token  =  median TPOT  −  1 / mock_tsu
 ```
-
-By sweeping `mock_tsu` and concurrency we separate three components:
-
-| Knob                | What it isolates                                          |
-| ------------------- | --------------------------------------------------------- |
-| Vary `mock_tsu`     | Linearity of overhead vs. forward cost (intercept = floor)|
-| Vary concurrency    | How much overhead amortises across requests per tick      |
-| `--disable-overlap-schedule` | Whether overlap deferral helps on CPU (expected: no) |
 
 ## Why this works
 
@@ -57,6 +61,21 @@ By sweeping `mock_tsu` and concurrency we separate three components:
   no-ops on CPU per `scheduler.py:1502-1503`), so the scheduler tick is
   exposed serially. The measurement is exactly what a CPU user pays.
 
+## Measured floor: ~0.46 ms / token
+
+`vllm bench serve` at concurrency = 1, ISL = 128, OSL = 2048, 4 prompts,
+TSU = 500 (forward floor = 2.0 ms / token):
+
+| Sampling                         | Median TPOT | Overhead vs floor |
+| -------------------------------- | ----------: | ----------------: |
+| `--temperature 0` (greedy)       |     2.46 ms |          +0.46 ms |
+| default (server-side sampling)   |     4.79 ms |          +2.79 ms |
+
+The greedy intercept (**~0.46 ms**) is SGLang's per-tick scheduler
+bookkeeping floor. The default-sampling row pays an extra ~2.3 ms / token of
+CPU-side sampler work; see the *Sampling* note below for why that doesn't
+apply to real DeepSeek serving.
+
 ## Caveats
 
 1. **`time.sleep()` granularity is ~1 ms on Linux.** Don't trust the floor
@@ -70,63 +89,51 @@ By sweeping `mock_tsu` and concurrency we separate three components:
    floor that becomes exposed *if* device forwards are faster than the
    scheduler tick — useful for understanding when scheduler cost will
    bottleneck a fast backend.
-4. **Constant forward time regardless of batch size.** A real model's forward
-   grows with batch; the mock doesn't. Fine for per-step overhead at fixed
-   concurrency, misleading for throughput-vs-batch extrapolation.
-5. **Single-stream amplifies per-token overhead.** At concurrency 1, one
-   scheduler tick produces one token. At concurrency 32, the same tick
-   produces 32 tokens → per-token overhead drops ~32×. Always report the
-   concurrency the number was measured at.
+4. **Single-user only.** See the *Scope* section above. Do not extrapolate
+   the reported number to concurrent-user TPOT; the mock can't model
+   batch-dependent forward time.
 
-## Sampling defaults dominate the reported overhead
+## Sampling: greedy vs default
 
-This script drives `/v1/chat/completions` via `sglang.bench_serving --backend
-sglang-oai-chat`, which injects `temperature=0` into every request
-(`bench_serving.py:404-405`). That short-circuits the sampler to argmax. Other
-benchmark tools (`vllm bench`, `guidellm`) **do not** set temperature, so the
-server falls through to the full sampling pipeline (top-p / top-k / multinomial)
-over the full vocab (131 072 entries for DeepSeek-R1).
+`vllm bench serve` no longer sets `temperature=0` by default; it falls
+through to whatever the server picks (top-p / top-k / multinomial over the
+full 131 072-entry DeepSeek-R1 vocab). The ~2.3 ms gap between the two rows
+above is **SGLang's CPU sampler cost on this host**, not anything in the
+scheduler, the network, or the client.
 
-Same server, same workload (ISL=128, OSL=1000, concurrency=1, TSU=500),
-single-stream curl in **non-streaming** mode (so no client/network involved):
-
-| Sampling                       | Wall-clock for 1000 tokens | TPOT     | Overhead vs 2 ms floor |
-| ------------------------------ | -------------------------: | -------: | ---------------------: |
-| `temperature=0` (greedy)       |                  2446.3 ms |  2.45 ms |               +0.45 ms |
-| server default (full sampling) |                  4675.9 ms |  4.68 ms |               +2.68 ms |
-
-The ~2.2 ms gap is pure server-side sampler cost on CPU; it has nothing to do
-with the client. That also explains the apparent gap between tools:
-
-| Client                                | Sampling            | Median TPOT |
-| ------------------------------------- | ------------------- | ----------: |
-| `sglang.bench_serving` (this script)  | injects `temp=0`    |     2.45 ms |
-| `vllm bench --backend openai-chat`    | server default      |     4.61 ms |
-| `guidellm --backend openai_http`      | server default      |     4.70 ms |
-| `curl` (greedy)                       | `temperature: 0`    |     2.45 ms |
-| `curl` (default)                      | server default      |     4.68 ms |
-
-So this script measures **SGLang's scheduler floor in isolation** (~0.5 ms)
-by stripping out the sampler. For an end-user TPOT estimate on DeepSeek-R1
-with realistic sampling, add the **~2.2 ms sampler cost** on top.
+**Note for DeepSeek:** since sampling for DeepSeek is done on the device,
+it is only valid to compare the greedy sampling from the client perspective.
+The ~2.3 ms gap for "default" sampling is a mock artifact — the mock returns
+logits to SGLang, forcing the CPU sampler path that a real Tenstorrent
+device would bypass regardless of the client's `temperature` setting.
 
 ## Running it
 
-The bench script handles server lifecycle, port allocation, and metric
-parsing:
+Start the server with the mock model:
 
 ```bash
-# default: tsu from config.json (500), concurrency 1, output_len 2048
-.venv/bin/python bench/run_streaming_overhead.py
-
-# tighter floor
-.venv/bin/python bench/run_streaming_overhead.py --tsu 1000
-
-# concurrency sweep
-for c in 1 4 16 64; do
-    .venv/bin/python bench/run_streaming_overhead.py --tsu 500 --concurrency $c
-done
+SGLANG_TENSTORRENT_MOCK_TSU=500 ./serve.sh
 ```
 
-Output ends with an `[overhead summary]` block showing mean/median/p99 ITL
-and their delta vs. the known floor.
+In another shell, run the canonical greedy bench:
+
+```bash
+vllm bench serve \
+    --model 'deepseek-ai/DeepSeek-R1-0528' \
+    --backend openai-chat \
+    --endpoint /v1/chat/completions \
+    --dataset-name random \
+    --random-input-len 128 \
+    --random-output-len 2048 \
+    --num-prompts 4 \
+    --max-concurrency 1 \
+    --temperature 0 \
+    --port 30050
+```
+
+Read **Median TPOT** from the output. Scheduler overhead =
+`Median TPOT − 1000 / mock_tsu` (ms).
+
+For the default-sampling reference, drop `--temperature 0` — but remember
+that the extra ~2.3 ms it shows is a mock artifact (see *Sampling* above).
+Always run at concurrency = 1 — see *Scope* above.
