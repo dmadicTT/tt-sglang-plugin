@@ -37,7 +37,7 @@ SAMPLING=default ./bench.sh                    # client default sampling
 single-user against `/v1/chat/completions`, and tears the server down on
 exit. Subtract `1000 / TSU` ms from the reported Median TPOT to read off
 SGLang's scheduler floor — currently **~0.45 ms / token**. See
-[`bench/README.md`](bench/README.md) for the methodology and the on-device
+[`HOW_WE_MEASURE_OVERHEAD.md`](HOW_WE_MEASURE_OVERHEAD.md) for the methodology and the on-device
 sampling shim that makes the number invariant to client sampling config.
 
 ## Plugin code

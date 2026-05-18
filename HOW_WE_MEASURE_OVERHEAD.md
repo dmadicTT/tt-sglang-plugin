@@ -1,4 +1,4 @@
-# Measuring SGLang Scheduler Overhead
+# How We Measure SGLang Scheduler Overhead
 
 ## Goal
 
