@@ -16,52 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 MOCK_TSU_ENV = "SGLANG_TENSTORRENT_MOCK_TSU"
 MOCK_LOG_ENV = "SGLANG_TENSTORRENT_MOCK_LOG"
 
-# Pre-tokenized Wikipedia-style passage the mock emits cyclically so every
-# request streams the same recognisable content instead of a random walk through
-# the vocab. Tokenized once with the deepseek-ai/DeepSeek-R1-0528 tokenizer (193
-# tokens, max id 125517) so we don't need transformers / a tokenizer at model
-# init time. To regenerate, run:
-#
-#     from transformers import AutoTokenizer
-#     t = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-0528")
-#     t.encode(ELEPHANT_TEXT, add_special_tokens=False)
-#
-# Source text -- paraphrase of the lead section of
-# https://en.wikipedia.org/wiki/Elephant:
-#
-#     Elephants are the largest living land animals. Three living species are
-#     currently recognised: the African bush elephant, the African forest
-#     elephant, and the smaller Asian elephant. They are the only surviving
-#     members of the family Elephantidae and the order Proboscidea; extinct
-#     relatives include mammoths and mastodons. Distinctive features of
-#     elephants include a long proboscis called a trunk, tusks, large ear
-#     flaps, massive legs, and tough but sensitive grey skin. The trunk is
-#     used for breathing, bringing food and water to the mouth, and grasping
-#     objects. Tusks, derived from the incisor teeth, serve as weapons and as
-#     tools for moving objects and digging. The large ear flaps help maintain
-#     a constant body temperature as well as supporting communication. The
-#     pillar-like legs carry their great weight.
-#
-# Note: the deepseek-r1 tokenizer wrapper in transformers drops whitespace on
-# encode -> decode roundtrip, so the streamed text comes out word-concatenated.
-# Content is still the elephant passage above.
-ELEPHANT_TOKEN_IDS: tuple[int, ...] = (
-    57689, 57524, 591, 1805, 26423, 416, 86228, 1831, 276, 18450, 16, 1636, 266, 317,
-    340, 1045, 35369, 591, 125517, 63177, 2987, 28, 1805, 81063, 31757, 263, 302, 26750,
-    55295, 81063, 1486, 3700, 302, 26750, 40280, 1805, 26758, 264, 81960, 13768, 26750,
-    103979, 591, 1805, 16132, 27797, 88, 2331, 74531, 39499, 263, 33811, 57689, 26750,
-    13354, 458, 1805, 4010, 45411, 9948, 28860, 29, 3405, 6149, 4419, 6261, 261, 1104,
-    381, 4422, 48729, 458, 79, 648, 401, 1054, 5249, 435, 6149, 505, 69437, 2154, 13768,
-    57524, 5211, 60114, 39634, 9948, 3487, 10546, 268, 84, 7048, 20197, 349, 813, 14,
-    40372, 707, 1668, 3471, 28558, 624, 505, 3743, 85, 40280, 86, 1446, 5887, 85, 28118,
-    28411, 922, 8705, 14170, 3050, 7048, 278, 6497, 2251, 3836, 50189, 16181, 981, 288,
-    49295, 458, 9372, 60737, 2868, 2960, 40280, 73, 5171, 22153, 42891, 5903, 349, 813,
-    14, 1514, 2419, 5356, 1805, 2769, 278, 20612, 1089, 14, 82136, 306, 971, 68970, 458,
-    648, 13397, 794, 23049, 42891, 458, 24222, 5426, 14170, 40372, 707, 1668, 3471,
-    4247, 7787, 499, 2260, 19092, 41931, 7193, 88634, 306, 8807, 624, 27232, 288, 52511,
-    14170, 49241, 287, 11727, 3743, 1822, 19879, 39283, 52574, 11026, 16,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -113,12 +67,11 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
         self._last_writes: list[tuple[int, int]] = []
         logger.info(
             "mock model init: tsu=%.3f tokens/sec/user, delay=%.6f s, "
-            "vocab_size=%d, max_generated_tokens=%d, fixed_text_tokens=%d",
+            "vocab_size=%d, max_generated_tokens=%d",
             self.mock_tsu,
             self.token_delay_seconds,
             self.vocab_size,
             self.max_generated_tokens,
-            len(ELEPHANT_TOKEN_IDS),
         )
 
     def forward(
@@ -194,7 +147,11 @@ class TenstorrentDeepSeekR10528ForCausalLM(nn.Module):
     def _sample_next_token_on_device(self, generated: int) -> int:
         if generated >= self.max_generated_tokens:
             return self.eos_token_id
-        return ELEPHANT_TOKEN_IDS[generated % len(ELEPHANT_TOKEN_IDS)]
+
+        first_regular_token_id = 4
+        return first_regular_token_id + (
+            generated % (self.vocab_size - first_regular_token_id)
+        )
 
 
 EntryClass = TenstorrentDeepSeekR10528ForCausalLM
